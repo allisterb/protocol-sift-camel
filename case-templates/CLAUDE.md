@@ -1,9 +1,23 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Per-case project instructions, layered on top of the global `~/.claude/CLAUDE.md`. All forensics in
+this case run through the **Camel** code-mode MCP server (see the global file for the required loop).
 
 **Course:** SANS FOR508 — Advanced Incident Response, Threat Hunting & Digital Forensics
 **Scenario:** Stark Research Labs (SRL) — Lab 1.1 APT Incident Response Challenge
+
+> This template ships with the SRL FOR508 demo scenario. Strip the SRL-specific content and fill in
+> the new engagement's details before use. The `Known IOCs` and `Incident Timeline` tables start as
+> scaffolding — populate them only with artifacts you confirm through Camel, citing each finding's
+> `[audit] invocation=<id>` handle.
+
+---
+
+## Start here — Camel session bootstrap
+
+1. Read the SDK references `camel://sdk/core` then `camel://sdk/schema`.
+2. `SetCaseId("srl-rd01")` (use a case id meaningful to this engagement).
+3. Drive the investigation with `ExecuteJavaScript`. Prefer workflows; cite audit handles.
 
 ---
 
@@ -22,111 +36,79 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Evidence Files
 
-| File | System | Notes |
-|------|--------|-------|
+| File (path on SIFT) | System | Notes |
+|---------------------|--------|-------|
 | `/cases/srl/base-dc-cdrive.E01` | dc01 — Domain Controller | C: drive (~12.5 GB) |
 | `/cases/srl/base-rd01-cdrive.E01` | rd01 — Remote Desktop Server | C: drive (~16.6 GB) — **primary compromise host** |
 | `/cases/memory/rd01-memory.img` | rd01 | RAM capture (5 GB, primary analysis image) |
 | `/cases/srl/base-rd_memory.img` | rd01 | RAM capture (3 GB, baseline-era image) |
 | `/cases/srl/base-dc_memory.img` | dc01 | RAM capture (5 GB) |
 
-**Read-only — do NOT modify evidence files.**
-Output all analysis to `./analysis/`, `./exports/`, or `./reports/` (relative to `/cases/srl/`).
+**Read-only — Camel mounts and reads evidence read-only; never modify these files.**
+Write your own analysis only to `./analysis/`, `./exports/`, or `./reports/` (relative to the case dir).
 
 ---
 
-## Common Commands
+## Camel recipes for this case
 
-### Mount E01 images (read-only)
+Paths below are on the SIFT workstation. These are starting points — consult `camel://sdk/core` for
+the full method list and exact signatures, and check `IsSuccess` / `null` on every result.
 
-```bash
-# Mount rd01 C: drive
-sudo mkdir -p /mnt/ewf_rd01 /mnt/rd01
-sudo ewfmount /cases/srl/base-rd01-cdrive.E01 /mnt/ewf_rd01
-sudo mount -o ro,loop,noatime /mnt/ewf_rd01/ewf1 /mnt/rd01
+### Disk → mount → triage timeline → anomaly pivots (rd01)
 
-# Mount dc01 C: drive
-sudo mkdir -p /mnt/ewf_dc01 /mnt/dc01
-sudo ewfmount /cases/srl/base-dc-cdrive.E01 /mnt/ewf_dc01
-sudo mount -o ro,loop,noatime /mnt/ewf_dc01/ewf1 /mnt/dc01
-
-# Unmount when done
-sudo umount /mnt/rd01 && sudo umount /mnt/ewf_rd01
-sudo umount /mnt/dc01 && sudo umount /mnt/ewf_dc01
+```js
+// Mount the rd01 C: drive read-only, then build a triage super-timeline and let the
+// anomaly engine surface the high-signal pivots in surrounding context.
+const mount = await DiskAnalysisWorkflow.MountEwfImageAsync(
+  "/cases/srl/base-rd01-cdrive.E01", "/mnt/ewf_rd01");
+if (!mount.IsSuccess) { error(mount.Message); }
+else {
+  const fs = await DiskAnalysisWorkflow.MountFileSystemAsync(
+    mount.Result, /* offset */ mount.Result.Partitions[0].StartSector, "/mnt/rd01");
+  const tl = await TimelineAnalysisWorkflow.CreateTriageTimelineAsync("/mnt/rd01", "/cases/srl/rd01.plaso");
+  if (tl.IsSuccess) {
+    const piv = await TimelineAnalysisWorkflow.AutoPivotExpansionAsync("/cases/srl/rd01.plaso", 200, 10, 5, true);
+    log(piv.Message);
+    for (const p of piv.Result.Pivots)
+      log(`${p.Pivot.Time} ${p.Pivot.EventType} [${p.Pivot.Bits.toFixed(0)} bits] — ${p.SurroundingCount} events`);
+  }
+}
 ```
 
-### Volatility 3 (memory — rd01)
+### Memory — full malware hunt (rd01)
 
-```bash
-VOL="python3 /opt/volatility3-2.20.0/vol.py"
-IMG="/cases/memory/rd01-memory.img"
-
-# Human-readable process tree
-$VOL -f $IMG -r pretty windows.pstree | cut -d '|' -f 1-11
-
-# All processes incl. exited
-$VOL -f $IMG windows.psscan | grep -v "N/A"
-
-# Command lines
-$VOL -f $IMG windows.cmdline | tee ./exports/cmdline.txt
-
-# Process SIDs
-$VOL -f $IMG windows.getsids | tee ./exports/getsids.txt
-
-# Network connections
-$VOL -f $IMG -r csv windows.netstat | tee ./exports/netstat.csv
-
-# DLL list for a specific PID
-$VOL -f $IMG -r csv windows.dlllist --pid 1912 | tee ./exports/dlllist-stun.csv
+```js
+const r = await MemoryAnalysisWorkflow.FindMalwareAsync("/cases/memory/rd01-memory.img", "/cases/srl/dumps");
+if (r.IsSuccess)
+  for (const s of r.Result.HighConfidenceSuspects)
+    log(`${s.Process} (PID ${s.Pid}) [${s.Categories.join(", ")}] ${s.Signals.join("; ")}`);
 ```
 
-### Memory Baseliner (process / service / driver diff)
+### Windows host artifacts (from the mounted rd01 volume)
 
-```bash
-python3 /opt/memory-baseliner/baseline.py \
-  -proc -i /cases/memory/rd01-memory.img \
-  --loadbaseline \
-  --jsonbaseline /cases/memory/baseline/Win11x64_proc_baseline.json \
-  -o ./exports/proc_baseline_diff.csv
+```js
+// Execution evidence, persistence, lateral movement — see WindowsAnalysisWorkflow in camel://sdk/core.
+const exec = await WindowsAnalysisWorkflow.AnalyzeExecutionEvidenceAsync(
+  "/mnt/rd01/Windows/System32/config/SYSTEM",
+  "/mnt/rd01/Windows/AppCompat/Programs/Amcache.hve");
+if (exec.IsSuccess) log(`${exec.Result.Entries.length} execution artifacts`);
+
+const lat = await WindowsAnalysisWorkflow.HuntLateralMovementAsync(
+  "/mnt/rd01/Windows/System32/winevt/Logs/Security.evtx");
+if (lat.IsSuccess) log(lat.Message);
 ```
 
-### EZ Tools (dotnet, Windows artifacts from mounted image)
+### Targeted timeline keyword search / pivot
 
-```bash
-# MFTECmd — parse MFT
-dotnet /opt/zimmermantools/MFTECmd.dll \
-  -f /mnt/rd01/\$MFT \
-  --csv ./exports/ --csvf rd01-mft.csv
-
-# EvtxECmd — parse event logs
-dotnet /opt/zimmermantools/EvtxeCmd/EvtxECmd.dll \
-  -d /mnt/rd01/Windows/System32/winevt/Logs/ \
-  --csv ./exports/ --csvf rd01-evtx.csv \
-  --maps /opt/zimmermantools/EvtxeCmd/Maps/
-
-# RECmd — registry hives
-dotnet /opt/zimmermantools/RECmd/RECmd.dll \
-  -d /mnt/rd01/Windows/System32/config/ \
-  --csv ./exports/ --csvf rd01-registry.csv
-
-# AmcacheParser
-dotnet /opt/zimmermantools/AmcacheParser.dll \
-  -f /mnt/rd01/Windows/AppCompat/Programs/Amcache.hve \
-  --csv ./exports/ --csvf rd01-amcache.csv
+```js
+const hits = await TimelineAnalysisWorkflow.SearchTimelineAsync(
+  "/cases/srl/rd01.plaso", ["STUN.exe", "172.16.6.12", "msedge"]);
+if (hits.IsSuccess) for (const h of hits.Result.Events) log(`${h.Time}  ${h.Description}`);
 ```
 
-### Sleuth Kit (filesystem, no mount required)
-
-```bash
-# List files — rd01 image
-fls -r -o 2048 /mnt/ewf_rd01/ewf1 | grep -i "stun"
-
-# Extract a file by inode
-icat -o 2048 /mnt/ewf_rd01/ewf1 <INODE> > ./exports/stun_extracted.exe
-
-# Verify image
-ewfverify /cases/srl/base-rd01-cdrive.E01
-```
+> Memory-image guidance for **pre-Win10** baselines: pass `legacyMode = true` to
+> `FindMalwareAsync`. For very large DC event logs, prefer the scoped/triage workflow methods over
+> whole-log passes (see `camel://sdk/core`).
 
 ---
 
@@ -157,6 +139,8 @@ ewfverify /cases/srl/base-rd01-cdrive.E01
 ---
 
 ## Known IOCs
+
+> Populate only with artifacts confirmed through Camel; cite each finding's audit invocation id.
 
 ### Confirmed Malware
 
@@ -191,8 +175,10 @@ ewfverify /cases/srl/base-rd01-cdrive.E01
 
 ## Notes
 
-- **Kansa Autorunsc CSVs** (`rd01/dc01/file01/hunt01`) are on the Windows forensic workstation at `G:\SRL_Evidence\kansa\kansa-post-intrusion\Output_20230129122316\Autorunsc\` — not on this SIFT instance.
-- **MemProcFS** is not installed on this SIFT instance.
-- **VSCMount** is Windows-only — do not use on SIFT.
+- All forensic tool execution and the chain-of-custody audit log are handled by Camel
+  (`audit-<caseId>.clef`). Do not run forensic CLIs directly — `Bash` is denied by policy, so Camel
+  is the only execution path.
 - Timestamps: always report in UTC.
-- Vol3 binary: `/opt/volatility3-2.20.0/vol.py` — NOT `/usr/local/bin/vol.py` (that is Vol2).
+- Reports: write your report as Markdown to `./reports/` with the Write tool. (PDF rendering via
+  `generate_pdf_report.py` needs the shell, which is denied — it's an optional manual post-step for
+  the operator, not something you run.)
