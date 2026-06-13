@@ -139,7 +139,7 @@ The script will:
 - Install `global/CLAUDE.md` and `global/settings.json` into `~/.claude/`
 - Install the case template and a `.mcp.json` that registers the `camel` server (with the resolved
   `Camel.CLI.dll` path) into `~/.claude/case-templates/`
-- Install the PDF report generator into `~/.claude/analysis-scripts/`
+- Install the analysis scripts (the chat-log hook + PDF generator) into `~/.claude/analysis-scripts/`
 - Back up any existing `~/.claude/{CLAUDE.md,settings.json}` to `.bak-<timestamp>` first
 
 You can also pass the path positionally: `bash install.sh /opt/camel/Camel.CLI.dll`.
@@ -152,35 +152,70 @@ You can also pass the path positionally: `bash install.sh /opt/camel/Camel.CLI.d
 protocol-sift-camel/
 ├── README.md                          ← this file
 ├── install.sh                         ← installer (registers the Camel MCP server)
+├── create-case.sh                     ← scaffold a case dir (Linux/SIFT/WSL/Git Bash)
+├── create-case.cmd                    ← scaffold a case dir (Windows)
 ├── global/
 │   ├── CLAUDE.md                      ← global instructions: drive DFIR through Camel
-│   └── settings.json                  ← allow mcp__camel__*; deny raw forensic CLIs
+│   └── settings.json                  ← allow mcp__camel__*; deny Bash; SessionEnd chat-log hook
 ├── case-templates/
-│   ├── CLAUDE.md                      ← per-case template (Camel SDK recipes)
+│   ├── CLAUDE.md                      ← per-case template (Camel SDK recipes; __CASE_ID__ placeholder)
 │   └── .mcp.json                      ← registers the `camel` stdio MCP server
 └── analysis-scripts/
-    └── generate_pdf_report.py         ← WeasyPrint PDF generator (unchanged)
+    ├── preserve_chatlog.py            ← SessionEnd hook: bundle the client chat log into the case
+    └── generate_pdf_report.py         ← WeasyPrint PDF generator (optional manual post-step)
 ```
 
 ---
 
 ## Starting a fresh investigation
 
+Use the `create-case` helper (in this repo) to scaffold a case directory. It creates
+`<cases-dir>/<case-id>/{analysis,exports,reports}`, copies the case `CLAUDE.md` (with the case id
+filled into the `SetCaseId(...)` call), `.mcp.json`, and the PDF report helper, and sets
+`CASE` / `CASE_DIR`:
+
 ```bash
-# 1. Prepare the case directory
-export CASE=CLIENT-IR-2025-001
-mkdir -p /cases/${CASE}/{analysis,exports,reports}
-cp ~/.claude/case-templates/CLAUDE.md /cases/${CASE}/CLAUDE.md
-cp ~/.claude/case-templates/.mcp.json /cases/${CASE}/.mcp.json   # registers the camel server
-cp ~/.claude/analysis-scripts/generate_pdf_report.py /cases/${CASE}/analysis/
-nano /cases/${CASE}/CLAUDE.md   # fill in case details
+# Linux / SIFT / WSL / Git Bash — source it to keep $CASE set in your shell
+. ./create-case.sh /cases CLIENT-IR-2025-001
+```
 
-# 2. Make evidence available to Camel (Camel mounts/reads it read-only via its SDK)
+```bat
+REM Windows (e.g. driving a remote SIFT over SSH)
+create-case.cmd C:\cases CLIENT-IR-2025-001
+```
 
-# 3. Launch Claude from the case root (sets relative Write paths)
-cd /cases/${CASE}
+Then finish setup and launch:
+
+```bash
+# 1. Edit the case CLAUDE.md with the engagement details
+nano "$CASE_DIR/CLAUDE.md"
+
+# 2. Point .mcp.json at your Camel.CLI.dll (and add --ssh --host/--user/--pass for a remote SIFT)
+nano "$CASE_DIR/.mcp.json"
+
+# 3. Make the evidence available to Camel (it mounts/reads read-only via its SDK)
+
+# 4. Launch Claude from the case root (sets relative Write paths)
+cd "$CASE_DIR"
 claude
 ```
+
+> **Existing case dir?** `create-case` is idempotent — it leaves an existing `CLAUDE.md` / `.mcp.json`
+> untouched, so re-running won't clobber filled-in details or SSH settings.
+
+<details>
+<summary>Manual setup (no helper script)</summary>
+
+```bash
+export CASE=CLIENT-IR-2025-001
+mkdir -p /cases/${CASE}/{analysis,exports,reports}
+cp case-templates/CLAUDE.md  /cases/${CASE}/CLAUDE.md
+cp case-templates/.mcp.json  /cases/${CASE}/.mcp.json   # registers the camel server
+cp analysis-scripts/generate_pdf_report.py /cases/${CASE}/analysis/
+nano /cases/${CASE}/CLAUDE.md   # fill in case details + replace __CASE_ID__ in SetCaseId(...)
+cd /cases/${CASE} && claude
+```
+</details>
 
 In the session, Claude reads `camel://sdk/core` and `camel://sdk/schema`, calls `SetCaseId`, then
 drives the case with `ExecuteJavaScript` — preferring Camel workflows, dropping to toolkits for

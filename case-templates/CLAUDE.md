@@ -16,7 +16,8 @@ this case run through the **Camel** code-mode MCP server (see the global file fo
 ## Start here — Camel session bootstrap
 
 1. Read the SDK references `camel://sdk/core` then `camel://sdk/schema`.
-2. `SetCaseId("srl-rd01")` (use a case id meaningful to this engagement).
+2. `SetCaseId("__CASE_ID__")` — the audit case id for this engagement (`create-case` fills this in;
+   if you see the literal `__CASE_ID__` here, replace it with a short case id of your own).
 3. Drive the investigation with `ExecuteJavaScript`. Prefer workflows; cite audit handles.
 
 ---
