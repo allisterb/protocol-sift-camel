@@ -1,5 +1,0 @@
-# Keep shell scripts LF (run on Linux SIFT / Git Bash / WSL) and Windows batch CRLF.
-*.sh        text eol=lf
-install.sh  text eol=lf
-*.cmd       text eol=crlf
-*.bat       text eol=crlf
