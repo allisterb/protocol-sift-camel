@@ -4,6 +4,11 @@ A fork of [Protocol SIFT](https://github.com/teamdfir/protocol-sift) (originally
 that drives Claude Code through the **[Camel](https://github.com/allisterb/Camel) code-mode MCP
 server** instead of hand-written skill files calling forensic CLIs directly.
 
+> **Camel documentation** (in the Camel repo): [Architecture](https://github.com/allisterb/Camel/blob/master/docs/Architecture.md)
+> · [Constraints & guardrails](https://github.com/allisterb/Camel/blob/master/docs/Constraints.md)
+> · [Audit trail](https://github.com/allisterb/Camel/blob/master/docs/AuditTrail.md)
+> · [worked three-claim trace](https://github.com/allisterb/Camel/tree/master/demo/audit-sample).
+
 ## What changed, and why
 
 The upstream Protocol SIFT configures Claude Code with a broad shell allow-list and a set of
@@ -18,7 +23,7 @@ model's context. Camel also records every tool execution to a per-case audit log
 
 | Aspect | Upstream Protocol SIFT | This fork (Camel) |
 |--------|------------------------|-------------------|
-| Tool access | Direct shell CLIs, pre-approved | Camel MCP server (`ExecuteJavaScript`) |
+| Tool access | Direct shell CLIs, pre-approved | Camel MCP server (`Execute`) |
 | DFIR knowledge | `skills/*/SKILL.md` prompt libraries | Codified in Camel workflows |
 | Output handling | Raw tool output into context (`tee` to `./exports`) | Distilled in-script; only results returned |
 | Audit trail | `Stop` hook → `forensic_audit.log` | Camel per-case CLEF log (`audit-<caseId>.clef`) |
@@ -43,7 +48,7 @@ write its Markdown report to the output dirs with the file tools; it just cannot
 | **Camel**, published | A built `Camel.CLI.dll` (default `/opt/camel/Camel.CLI.dll`) — provides the `create-case` and `server` commands |
 | **.NET 9 runtime** | Required by Camel — <https://dotnet.microsoft.com/download/dotnet/9.0> |
 | Anthropic API key | Set in `~/.claude/.credentials.json` after first `claude` run — **never copy** this file |
-| Python 3 | Runs the `SessionEnd` chat-log hook. `pip3 install weasyprint` too if you want the optional PDF report |
+| Python 3 + WeasyPrint | Optional — only for the manual PDF report helper (`pip3 install weasyprint`) |
 
 Camel can run on the SIFT workstation itself (local environment) or on a separate machine (e.g.
 Windows) that reaches the SIFT box over SSH.
@@ -61,9 +66,9 @@ and hook lives *inside the case*, so everything Claude Code needs travels with t
 ├── CLAUDE.md                ← per-case instructions (SetCaseId pre-filled with the case id)
 ├── .mcp.json                ← registers the `camel` stdio MCP server (with the right dll path + mode)
 ├── .claude/
-│   ├── settings.json        ← code-mode policy: allow mcp__camel__*, deny Bash, + the chat-log hook
-│   └── preserve_chatlog.py  ← SessionEnd hook: bundles the client chat log into the case
-├── analysis/  exports/  reports/   ← the only dirs Claude may write to
+│   └── settings.json        ← code-mode policy: allow mcp__camel__*, deny Bash, + the SessionEnd hook
+├── logs/                    ← chain of custody: audit-<caseId>.clef + chatlog-*.jsonl + token-usage.json
+├── exports/  reports/       ← the dirs Claude may write to
 ```
 
 > Because the Camel edition writes nothing to `~/.claude`, you can install **upstream Protocol SIFT and
@@ -78,7 +83,7 @@ server …`) — nothing extra to start. The server exposes:
 | MCP surface | Purpose |
 |-------------|---------|
 | `SetCaseId` (tool) | Set the audit case id — called once per case |
-| `ExecuteJavaScript` (tool) | Run a JS program against the Camel DFIR SDK |
+| `Execute` (tool) | Run a JS program against the Camel DFIR SDK |
 | `camel://sdk/core` (resource) | SDK execution model + every object/method |
 | `camel://sdk/schema` (resource) | JSON schema of every returned value |
 
@@ -112,7 +117,7 @@ filename. `create-case` is **idempotent**: an existing `CLAUDE.md` / `.mcp.json`
 left untouched, so re-running never clobbers filled-in details or SSH settings.
 
 In the session, Claude reads `camel://sdk/core` and `camel://sdk/schema`, calls `SetCaseId`, then drives
-the case with `ExecuteJavaScript` — preferring Camel workflows, dropping to toolkits for primitives, and
+the case with `Execute` — preferring Camel workflows, dropping to toolkits for primitives, and
 using the anomaly engine to triage large timelines.
 
 ### Running against a remote SIFT workstation (SSH)
@@ -156,9 +161,9 @@ protocol-sift-camel/
     └── generate_pdf_report.py         ← optional manual WeasyPrint PDF generator
 ```
 
-Everything else — the case `CLAUDE.md`, `.mcp.json`, `.claude/settings.json`, and
-`.claude/preserve_chatlog.py` — is **embedded in the Camel CLI** and emitted by `create-case`. This
-repo is essentially documentation: a Camel release plus Claude Code is all you need.
+Everything else — the case `CLAUDE.md`, `.mcp.json`, and `.claude/settings.json` — is **embedded in
+the Camel CLI** and emitted by `create-case`. This repo is essentially documentation: a Camel release
+plus Claude Code is all you need.
 
 ---
 
@@ -166,16 +171,25 @@ repo is essentially documentation: a Camel release plus Claude Code is all you n
 
 - **Read-only evidence** — Camel mounts and reads evidence read-only; Claude never writes to
   `/cases/`, `/mnt/`, or `/media/`.
-- **Per-case audit log** — Camel records every tool execution to `audit-<caseId>.clef` (case id,
-  toolkit/tool, command, host, exit code, duration). Each `ExecuteJavaScript` result ends with an
-  `[audit] case=<caseId> invocation=<id>` handle; Claude cites it next to each finding so a reviewer
+  Everything below lands in the case's `logs/` directory, distinguished by filename — one place to
+  reconstruct the case.
+- **Per-case audit log** — Camel records every tool execution to `logs/audit-<caseId>.clef` (case id,
+  toolkit/tool, command, host, exit code, duration). Each `Execute` result ends with an
+  `[audit] case=<caseId> execution=<id>` handle; Claude cites it next to each finding so a reviewer
   can trace any conclusion back to the exact commands that produced it.
-- **Preserved chat log** — the case's `.claude/settings.json` registers a `SessionEnd` hook
-  (`.claude/preserve_chatlog.py`) that copies the full Claude Code client transcript (every message,
-  tool call, and timestamp) into `analysis/chatlogs/` when the session ends, bundling it with the case
-  audit trail. The hook runs via the harness, not as an agent tool call, so it works despite the `Bash`
-  deny. (For an apples-to-apples benchmark, add the same hook to the upstream Protocol SIFT config so
-  both runs preserve their transcripts identically.)
+- **Preserved chat log** — the case's `.claude/settings.json` registers a `SessionEnd` hook that runs
+  `dotnet "<Camel.CLI.dll>" preserve-chatlog`, copying the full Claude Code client transcript (every
+  message, tool call, and timestamp) into `logs/chatlog-*.jsonl` when the session ends, bundling it with
+  the audit log. The hook runs via the harness (not as an agent tool call, so it works despite the
+  `Bash` deny) and needs only the .NET runtime — no python. (For an apples-to-apples benchmark, add an
+  equivalent transcript-preserving hook to the upstream Protocol SIFT config.)
+- **Tokens consumed** — the same `SessionEnd` hook writes `logs/token-usage.json`: the raw per-turn
+  `usage` totals (input / output / cache-create / cache-read / sum) plus a `breakdown` that separates
+  **cached** reuse (`cached_tokens` = cache reads, billed ~0.1×) from **new** tokens
+  (`new_tokens` = fresh input + cache writes + output), with a per-model breakdown, turn count, and the
+  cache-hit fraction of input. This is the efficiency/cost figure for the judges, captured automatically
+  — and the cached/new split keeps a cache-heavy total (e.g. 18M total, ~0.9M actually new) from being
+  read as full-price usage.
 - **No raw shell** — the forensic CLIs are denied by policy; all tool execution flows through Camel.
 
 ---
