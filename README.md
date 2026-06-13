@@ -28,9 +28,9 @@ model's context. Camel also records every tool execution to a per-case audit log
 This fork exists to **benchmark** the two approaches: run a scenario under upstream Protocol SIFT,
 then under this Camel edition, and compare wall-clock time, token usage, hallucinations, and accuracy.
 To isolate the variable under test (code-mode vs. skills + raw CLIs), the Camel edition **denies the
-shell entirely** — `settings.json` blocks `Bash`, so the agent is *guaranteed* to run all forensics
-through the Camel MCP server and nothing else. The agent can still read files and write its Markdown
-report to the output dirs with the file tools; it just cannot shell out.
+shell entirely** — the case's `.claude/settings.json` blocks `Bash`, so the agent is *guaranteed* to
+run all forensics through the Camel MCP server and nothing else. The agent can still read files and
+write its Markdown report to the output dirs with the file tools; it just cannot shell out.
 
 ---
 
@@ -39,21 +39,41 @@ report to the output dirs with the file tools; it just cannot shell out.
 | Requirement | Notes |
 |-------------|-------|
 | SANS SIFT Workstation | Ubuntu x86-64, standard SIFT tool set installed |
-| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` (or your org's channel) — the installer fetches it if missing |
-| **Camel**, published | A built `Camel.CLI.dll` on the SIFT box (default `/opt/camel/Camel.CLI.dll`) |
+| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` (or your org's channel) |
+| **Camel**, published | A built `Camel.CLI.dll` (default `/opt/camel/Camel.CLI.dll`) — provides the `create-case` and `server` commands |
 | **.NET 9 runtime** | Required by Camel — <https://dotnet.microsoft.com/download/dotnet/9.0> |
 | Anthropic API key | Set in `~/.claude/.credentials.json` after first `claude` run — **never copy** this file |
-| Python 3 + WeasyPrint | `pip3 install weasyprint` — only for PDF report generation |
+| Python 3 | Runs the `SessionEnd` chat-log hook. `pip3 install weasyprint` too if you want the optional PDF report |
 
-Camel can run on the SIFT workstation itself (local environment) or on a separate machine that reaches
-the SIFT box over SSH — configured in Camel's own `appsettings.json`, independent of this fork.
+Camel can run on the SIFT workstation itself (local environment) or on a separate machine (e.g.
+Windows) that reaches the SIFT box over SSH.
 
 ---
 
-## How the wiring works
+## How it works
 
-The installer registers Camel as a **stdio MCP server** named `camel`. Claude Code launches it per
-session (`dotnet <CAMEL_DLL> server`) — there is nothing extra to start. The server exposes:
+There is no installer, and **nothing touches your global `~/.claude` config.** The Camel CLI's
+**`create-case`** command scaffolds a fully self-contained case directory — every setting, permission,
+and hook lives *inside the case*, so everything Claude Code needs travels with the case:
+
+```
+<case-dir>/
+├── CLAUDE.md                ← per-case instructions (SetCaseId pre-filled with the case id)
+├── .mcp.json                ← registers the `camel` stdio MCP server (with the right dll path + mode)
+├── .claude/
+│   ├── settings.json        ← code-mode policy: allow mcp__camel__*, deny Bash, + the chat-log hook
+│   └── preserve_chatlog.py  ← SessionEnd hook: bundles the client chat log into the case
+├── analysis/  exports/  reports/   ← the only dirs Claude may write to
+```
+
+> Because the Camel edition writes nothing to `~/.claude`, you can install **upstream Protocol SIFT and
+> this fork side-by-side** on the same SIFT box and run either against the same scenario without their
+> configs colliding — exactly what a fair benchmark needs. Once you have a Camel release, the only other
+> thing this fork needs is Claude Code (install it if it isn't already).
+
+`create-case` knows its own assembly path and bakes it (plus any SSH options you pass) into the
+generated `.mcp.json`, so Claude Code launches the server itself per session (`dotnet <CAMEL_DLL>
+server …`) — nothing extra to start. The server exposes:
 
 | MCP surface | Purpose |
 |-------------|---------|
@@ -62,87 +82,68 @@ session (`dotnet <CAMEL_DLL> server`) — there is nothing extra to start. The s
 | `camel://sdk/core` (resource) | SDK execution model + every object/method |
 | `camel://sdk/schema` (resource) | JSON schema of every returned value |
 
-### Method 1 — curl one-liner (recommended)
-
 > **Transport note:** stdio is used by design — Camel's session management, the `SetCaseId` audit
-> attribution, the progress heartbeat, and cancellation are all transport-agnostic (stdio buckets the
-> single client under one session id). Camel also supports an HTTP transport
-> (`dotnet <CAMEL_DLL> server --http`, default `http://localhost:5000`) if you prefer a shared,
-> long-lived server — point the `.mcp.json` at it with `"type": "http"` and a `"url"` instead.
+> attribution, the progress heartbeat, and cancellation are all transport-agnostic. Camel also supports
+> an HTTP transport (`dotnet <CAMEL_DLL> server --http`, default `http://localhost:5000`) if you prefer
+> a shared, long-lived server — point `.mcp.json` at it with `"type": "http"` and a `"url"` instead.
+
+---
+
+## Starting a fresh investigation
+
+```bash
+# 1. Scaffold the case (local SIFT). On Windows, use your paths, e.g.
+#    dotnet C:\camel\Camel.CLI.dll create-case C:\cases CLIENT-IR-2025-001
+dotnet /opt/camel/Camel.CLI.dll create-case /cases CLIENT-IR-2025-001
+
+# 2. Fill in the case details (and confirm SetCaseId is your case id)
+nano /cases/CLIENT-IR-2025-001/CLAUDE.md
+
+# 3. Make the evidence available to Camel (it mounts/reads read-only via its SDK)
+
+# 4. Launch Claude from the case root
+cd /cases/CLIENT-IR-2025-001
+claude
+```
+
+The case id (`CLIENT-IR-2025-001` above) must be a safe identifier — letters, digits, dot, underscore,
+dash — because it becomes the directory name, the `SetCaseId("…")` value, and the `audit-<caseId>.clef`
+filename. `create-case` is **idempotent**: an existing `CLAUDE.md` / `.mcp.json` / `.claude/` file is
+left untouched, so re-running never clobbers filled-in details or SSH settings.
+
+In the session, Claude reads `camel://sdk/core` and `camel://sdk/schema`, calls `SetCaseId`, then drives
+the case with `ExecuteJavaScript` — preferring Camel workflows, dropping to toolkits for primitives, and
+using the anomaly engine to triage large timelines.
 
 ### Running against a remote SIFT workstation (SSH)
 
 Unlike upstream Protocol SIFT, Camel can run on a **separate machine** (e.g. Windows) and execute the
-forensic tools on a **remote Linux SIFT workstation over SSH**. The Camel CLI takes the SSH connection
-details as flags, so you don't have to edit Camel's `appsettings.json`:
+forensic tools on a **remote Linux SIFT workstation over SSH**. Pass the SSH connection details to
+`create-case` and they are baked into the case's `.mcp.json` (so Claude Code starts Camel in SSH mode):
 
 ```bash
-dotnet <CAMEL_DLL> server --ssh --host <sifthost> --user <siftuser> --pass <siftpass>
+dotnet /opt/camel/Camel.CLI.dll create-case /cases CLIENT-IR-2025-001 \
+  --ssh --host <sifthost> --user <siftuser> --pass <siftpass>
 # --port defaults to 22; supplying any of --host/--user/--pass implies --ssh unless --local is given.
 ```
 
-**You launch Camel in SSH mode by putting those options in the case's `.mcp.json`** — Claude Code
-runs whatever `args` you list, so just add the SSH flags after `"server"`. Edit
-`.mcp.json` to look like this:
+The resulting `.mcp.json` `args` look like this (the default, without SSH flags, is just `"server"` for
+a local SIFT box):
 
 ```json
-{
-  "mcpServers": {
-    "camel": {
-      "type": "stdio",
-      "command": "dotnet",
-      "args": [
-        "C:/camel/Camel.CLI.dll", "server",
-        "--ssh",
-        "--host", "<sifthost>",
-        "--user", "<siftuser>",
-        "--pass", "<siftpass>",
-        "--port", "22"
-      ],
-      "env": {}
-    }
-  }
-}
+"args": ["/opt/camel/Camel.CLI.dll", "server", "--ssh", "--host", "<sifthost>", "--user", "<siftuser>", "--pass", "<siftpass>"]
 ```
 
-The default `.mcp.json` (just `"server"`) runs Camel against the **local** SIFT box; adding the
-`--ssh --host/--user/--pass` options switches it to drive a **remote** SIFT over SSH. You can also let
-`install.sh` write this for you — set the SSH variables and it bakes the flags into the generated
-`.mcp.json`:
-
-```bash
-CAMEL_DLL=C:/camel/Camel.CLI.dll \
-CAMEL_SSH_HOST=<sifthost> CAMEL_SSH_USER=<siftuser> CAMEL_SSH_PASS=<siftpass> \
-  bash install.sh
-```
-
-> **Security note:** these flags put the SSH password on the process command line / in `.mcp.json`.
-> Use a throwaway lab credential (as in the SANS SIFT VM), restrict the file, and never commit a real
+> **Security note:** the SSH password ends up on the process command line / in `.mcp.json`. Use a
+> throwaway lab credential (as in the SANS SIFT VM), restrict the file, and never commit a real
 > `.mcp.json`. For anything sensitive, set the credentials in Camel's `appsettings.json` instead and
-> launch with just `--ssh`.
+> pass just `--ssh` to `create-case`.
 
----
+### Optional: PDF reports
 
-## Installation
-
-```bash
-git clone --depth=1 https://github.com/allisterb/protocol-sift-camel.git
-cd protocol-sift-camel
-
-# Point the installer at your published Camel CLI assembly (default: /opt/camel/Camel.CLI.dll)
-CAMEL_DLL=/opt/camel/Camel.CLI.dll bash install.sh
-```
-
-The script will:
-- Install Claude Code if it isn't already present
-- Check for the .NET 9 runtime and the Camel CLI assembly
-- Install `global/CLAUDE.md` and `global/settings.json` into `~/.claude/`
-- Install the case template and a `.mcp.json` that registers the `camel` server (with the resolved
-  `Camel.CLI.dll` path) into `~/.claude/case-templates/`
-- Install the analysis scripts (the chat-log hook + PDF generator) into `~/.claude/analysis-scripts/`
-- Back up any existing `~/.claude/{CLAUDE.md,settings.json}` to `.bak-<timestamp>` first
-
-You can also pass the path positionally: `bash install.sh /opt/camel/Camel.CLI.dll`.
+The agent writes Markdown reports (Bash is denied). To render one to PDF afterward,
+[`analysis-scripts/generate_pdf_report.py`](analysis-scripts/generate_pdf_report.py) is a WeasyPrint
+helper you run manually (`pip3 install weasyprint`).
 
 ---
 
@@ -151,75 +152,13 @@ You can also pass the path positionally: `bash install.sh /opt/camel/Camel.CLI.d
 ```
 protocol-sift-camel/
 ├── README.md                          ← this file
-├── install.sh                         ← installer (registers the Camel MCP server)
-├── create-case.sh                     ← scaffold a case dir (Linux/SIFT/WSL/Git Bash)
-├── create-case.cmd                    ← scaffold a case dir (Windows)
-├── global/
-│   ├── CLAUDE.md                      ← global instructions: drive DFIR through Camel
-│   └── settings.json                  ← allow mcp__camel__*; deny Bash; SessionEnd chat-log hook
-├── case-templates/
-│   ├── CLAUDE.md                      ← per-case template (Camel SDK recipes; __CASE_ID__ placeholder)
-│   └── .mcp.json                      ← registers the `camel` stdio MCP server
 └── analysis-scripts/
-    ├── preserve_chatlog.py            ← SessionEnd hook: bundle the client chat log into the case
-    └── generate_pdf_report.py         ← WeasyPrint PDF generator (optional manual post-step)
+    └── generate_pdf_report.py         ← optional manual WeasyPrint PDF generator
 ```
 
----
-
-## Starting a fresh investigation
-
-Use the `create-case` helper (in this repo) to scaffold a case directory. It creates
-`<cases-dir>/<case-id>/{analysis,exports,reports}`, copies the case `CLAUDE.md` (with the case id
-filled into the `SetCaseId(...)` call), `.mcp.json`, and the PDF report helper, and sets
-`CASE` / `CASE_DIR`:
-
-```bash
-# Linux / SIFT / WSL / Git Bash — source it to keep $CASE set in your shell
-. ./create-case.sh /cases CLIENT-IR-2025-001
-```
-
-```bat
-REM Windows (e.g. driving a remote SIFT over SSH)
-create-case.cmd C:\cases CLIENT-IR-2025-001
-```
-
-Then finish setup and launch:
-
-```bash
-# 1. Edit the case CLAUDE.md with the engagement details
-nano "$CASE_DIR/CLAUDE.md"
-
-# 2. Point .mcp.json at your Camel.CLI.dll (and add --ssh --host/--user/--pass for a remote SIFT)
-nano "$CASE_DIR/.mcp.json"
-
-# 3. Make the evidence available to Camel (it mounts/reads read-only via its SDK)
-
-# 4. Launch Claude from the case root (sets relative Write paths)
-cd "$CASE_DIR"
-claude
-```
-
-> **Existing case dir?** `create-case` is idempotent — it leaves an existing `CLAUDE.md` / `.mcp.json`
-> untouched, so re-running won't clobber filled-in details or SSH settings.
-
-<details>
-<summary>Manual setup (no helper script)</summary>
-
-```bash
-export CASE=CLIENT-IR-2025-001
-mkdir -p /cases/${CASE}/{analysis,exports,reports}
-cp case-templates/CLAUDE.md  /cases/${CASE}/CLAUDE.md
-cp case-templates/.mcp.json  /cases/${CASE}/.mcp.json   # registers the camel server
-cp analysis-scripts/generate_pdf_report.py /cases/${CASE}/analysis/
-nano /cases/${CASE}/CLAUDE.md   # fill in case details + replace __CASE_ID__ in SetCaseId(...)
-cd /cases/${CASE} && claude
-```
-</details>
-
-In the session, Claude reads `camel://sdk/core` and `camel://sdk/schema`, calls `SetCaseId`, then
-drives the case with `ExecuteJavaScript` — preferring Camel workflows, dropping to toolkits for
-primitives, and using the anomaly engine to triage large timelines.
+Everything else — the case `CLAUDE.md`, `.mcp.json`, `.claude/settings.json`, and
+`.claude/preserve_chatlog.py` — is **embedded in the Camel CLI** and emitted by `create-case`. This
+repo is essentially documentation: a Camel release plus Claude Code is all you need.
 
 ---
 
@@ -231,12 +170,12 @@ primitives, and using the anomaly engine to triage large timelines.
   toolkit/tool, command, host, exit code, duration). Each `ExecuteJavaScript` result ends with an
   `[audit] case=<caseId> invocation=<id>` handle; Claude cites it next to each finding so a reviewer
   can trace any conclusion back to the exact commands that produced it.
-- **Preserved chat log** — a `SessionEnd` hook (`analysis-scripts/preserve_chatlog.py`) copies the
-  full Claude Code client transcript (every message, tool call, and timestamp) into
-  `./analysis/chatlogs/` when the session ends, bundling the chat log with the case audit trail. The
-  hook runs via the harness, not as an agent tool call, so it works despite the `Bash` deny. (For an
-  apples-to-apples benchmark, add the same hook to the upstream Protocol SIFT config so both runs
-  preserve their transcripts identically.)
+- **Preserved chat log** — the case's `.claude/settings.json` registers a `SessionEnd` hook
+  (`.claude/preserve_chatlog.py`) that copies the full Claude Code client transcript (every message,
+  tool call, and timestamp) into `analysis/chatlogs/` when the session ends, bundling it with the case
+  audit trail. The hook runs via the harness, not as an agent tool call, so it works despite the `Bash`
+  deny. (For an apples-to-apples benchmark, add the same hook to the upstream Protocol SIFT config so
+  both runs preserve their transcripts identically.)
 - **No raw shell** — the forensic CLIs are denied by policy; all tool execution flows through Camel.
 
 ---
