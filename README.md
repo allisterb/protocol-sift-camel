@@ -1,15 +1,36 @@
-# Protocol SIFT
+# Protocol SIFT — Camel edition
 
-Rob Lee developed Protocol SIFT and all the files found within this repository.
+A fork of [Protocol SIFT](https://github.com/teamdfir/protocol-sift) (originally developed by Rob Lee)
+that drives Claude Code through the **[Camel](https://github.com/allisterb/Camel) code-mode MCP
+server** instead of hand-written skill files calling forensic CLIs directly.
 
-## Claude Code + SANS SIFT Workstation Setup
+## What changed, and why
 
-> [!IMPORTANT]
-> Replication Guide for SANS SIFT + Unconfigured Claude Code
+The upstream Protocol SIFT configures Claude Code with a broad shell allow-list and a set of
+`SKILL.md` files that teach the model how to invoke Volatility, Sleuth Kit, EZ Tools, Plaso, YARA,
+etc. one command at a time. The model reasons over raw tool output in its context window.
 
-This repository contains everything needed to replicate the DFIR-tuned Claude Code
-configuration on a bare SANS SIFT Ubuntu workstation. It covers global behavioral
-rules, forensic tool skill files, per-case project templates, and PDF report tooling.
+This fork replaces that with **code-mode**: all forensics go through the Camel MCP server, which
+exposes the SIFT tools as a typed JavaScript SDK plus higher-level DFIR **workflows** and an
+**anomaly-detection** engine. Claude writes a small JS program; Camel runs it on the SIFT box,
+executes the tools, and returns only the distilled result — keeping irrelevant tool output out of the
+model's context. Camel also records every tool execution to a per-case audit log for chain of custody.
+
+| Aspect | Upstream Protocol SIFT | This fork (Camel) |
+|--------|------------------------|-------------------|
+| Tool access | Direct shell CLIs, pre-approved | Camel MCP server (`ExecuteJavaScript`) |
+| DFIR knowledge | `skills/*/SKILL.md` prompt libraries | Codified in Camel workflows |
+| Output handling | Raw tool output into context (`tee` to `./exports`) | Distilled in-script; only results returned |
+| Audit trail | `Stop` hook → `forensic_audit.log` | Camel per-case CLEF log (`audit-<caseId>.clef`) |
+| Shell | Broad forensic-CLI allow-list | Same allow-list (matched for fairness); Camel preferred by instruction |
+| Where it runs | On the SIFT workstation | On the SIFT box **or** a remote machine driving SIFT over SSH |
+
+This fork exists to **benchmark** the two approaches: run a scenario under upstream Protocol SIFT,
+then under this Camel edition, and compare wall-clock time, token usage, hallucinations, and accuracy.
+To keep the comparison fair, the permission posture is **identical** to upstream — the same broad
+forensic-CLI allow-list and `acceptEdits` autonomy. The Camel edition steers the model to code-mode by
+**instruction** (in `CLAUDE.md`), not by denying the shell, so neither side is handicapped by a
+different permission experience.
 
 ---
 
@@ -18,375 +39,155 @@ rules, forensic tool skill files, per-case project templates, and PDF report too
 | Requirement | Notes |
 |-------------|-------|
 | SANS SIFT Workstation | Ubuntu x86-64, standard SIFT tool set installed |
-| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` (or via your org's approved channel) |
+| Claude Code CLI | `npm install -g @anthropic-ai/claude-code` (or your org's channel) — the installer fetches it if missing |
+| **Camel**, published | A built `Camel.CLI.dll` on the SIFT box (default `/opt/camel/Camel.CLI.dll`) |
+| **.NET 9 runtime** | Required by Camel — <https://dotnet.microsoft.com/download/dotnet/9.0> |
 | Anthropic API key | Set in `~/.claude/.credentials.json` after first `claude` run — **never copy** this file |
-| Python 3 + WeasyPrint | `pip3 install weasyprint` — required for PDF report generation |
-| dotnet runtime v6 | Pre-installed on SIFT; EZ Tools run against `/opt/zimmermantools/` |
+| Python 3 + WeasyPrint | `pip3 install weasyprint` — only for PDF report generation |
+
+Camel can run on the SIFT workstation itself (local environment) or on a separate machine that reaches
+the SIFT box over SSH — configured in Camel's own `appsettings.json`, independent of this fork.
+
+---
+
+## How the wiring works
+
+The installer registers Camel as a **stdio MCP server** named `camel`. Claude Code launches it per
+session (`dotnet <CAMEL_DLL> server`) — there is nothing extra to start. The server exposes:
+
+| MCP surface | Purpose |
+|-------------|---------|
+| `SetCaseId` (tool) | Set the audit case id — called once per case |
+| `ExecuteJavaScript` (tool) | Run a JS program against the Camel DFIR SDK |
+| `camel://sdk/core` (resource) | SDK execution model + every object/method |
+| `camel://sdk/schema` (resource) | JSON schema of every returned value |
+
+Permissions in `global/settings.json` pre-approve `mcp__camel__*` **and** keep upstream's broad
+forensic-CLI allow-list (matched for a fair benchmark); `CLAUDE.md` instructs the model to route all
+forensics through Camel regardless.
+
+> **Transport note:** stdio is used by design — Camel's session management, the `SetCaseId` audit
+> attribution, the progress heartbeat, and cancellation are all transport-agnostic (stdio buckets the
+> single client under one session id). Camel also supports an HTTP transport
+> (`dotnet <CAMEL_DLL> server --http`, default `http://localhost:5000`) if you prefer a shared,
+> long-lived server — point the `.mcp.json` at it with `"type": "http"` and a `"url"` instead.
+
+### Running against a remote SIFT workstation (SSH)
+
+Unlike upstream Protocol SIFT, Camel can run on a **separate machine** (e.g. Windows) and execute the
+forensic tools on a **remote Linux SIFT workstation over SSH**. The Camel CLI takes the SSH connection
+details as flags, so you don't have to edit Camel's `appsettings.json`:
+
+```bash
+dotnet <CAMEL_DLL> server --ssh --host 192.168.8.117 --user sansforensics --pass <password>
+# --port defaults to 22; supplying any of --host/--user/--pass implies --ssh unless --local is given.
+```
+
+To wire this into the fork, set the SSH variables when you run `install.sh` and it bakes the flags
+into the generated `.mcp.json` (so Claude Code launches Camel in SSH mode automatically):
+
+```bash
+CAMEL_DLL=C:/camel/Camel.CLI.dll \
+CAMEL_SSH_HOST=192.168.8.117 CAMEL_SSH_USER=sansforensics CAMEL_SSH_PASS=forensics \
+  bash install.sh
+```
+
+> **Security note:** these flags put the SSH password on the process command line / in `.mcp.json`.
+> Use a throwaway lab credential (as in the SANS SIFT VM), restrict the file, and never commit a real
+> `.mcp.json`. For anything sensitive, set the credentials in Camel's `appsettings.json` instead and
+> launch with just `--ssh`.
 
 ---
 
 ## Installation
 
-Choose one of three methods. All three end up with the same files in `~/.claude/`.
-
----
-
-### Method 1 — curl one-liner (recommended)
-
-Requires `git` on the target machine (standard on SIFT).
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/teamdfir/protocol-sift/main/install.sh | bash
+git clone --depth=1 https://github.com/allisterb/protocol-sift-camel.git
+cd protocol-sift-camel
+
+# Point the installer at your published Camel CLI assembly (default: /opt/camel/Camel.CLI.dll)
+CAMEL_DLL=/opt/camel/Camel.CLI.dll bash install.sh
 ```
 
 The script will:
-- Clone this repo into a temporary directory (cleaned up on exit)
-- Back up any existing `~/.claude/{CLAUDE.md,settings.json,settings.local.json}` to `.bak-<timestamp>` before overwriting
-- Install global config, all skills, the case template, and the PDF analysis script into `~/.claude/`
-- Print WeasyPrint install instructions (WeasyPrint prompt is skipped when stdin is piped)
+- Install Claude Code if it isn't already present
+- Check for the .NET 9 runtime and the Camel CLI assembly
+- Install `global/CLAUDE.md` and `global/settings.json` into `~/.claude/`
+- Install the case template and a `.mcp.json` that registers the `camel` server (with the resolved
+  `Camel.CLI.dll` path) into `~/.claude/case-templates/`
+- Install the PDF report generator into `~/.claude/analysis-scripts/`
+- Back up any existing `~/.claude/{CLAUDE.md,settings.json}` to `.bak-<timestamp>` first
 
-To also install WeasyPrint in the same step, run the script directly instead:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/teamdfir/protocol-sift/main/install.sh -o /tmp/install.sh
-bash /tmp/install.sh
-```
+You can also pass the path positionally: `bash install.sh /opt/camel/Camel.CLI.dll`.
 
 ---
 
-### Method 2 — Clone the repo
-
-```bash
-git clone --depth=1 https://github.com/teamdfir/protocol-sift.git
-cd protocol-sift
-bash install.sh
-```
-
-Keep the cloned directory around if you want to pull updates later (`git pull && bash install.sh`).
-
----
-
-### Method 3 — Download as ZIP archive
-
-1. Go to `https://github.com/teamdfir/protocol-sift` → **Code → Download ZIP**
-2. Extract the archive:
-   ```bash
-   unzip protocol-sift-main.zip
-   cd protocol-sift-main
-   ```
-3. Either run the bundled script:
-   ```bash
-   bash install.sh
-   ```
-   Or follow the manual file-by-file steps in the [File-by-File Installation Instructions](#file-by-file-installation-instructions) section below.
-
----
-
-## Repository Structure
+## Repository structure
 
 ```
-protocol-sift/
+protocol-sift-camel/
 ├── README.md                          ← this file
-├── install.sh                         ← automated installer
+├── install.sh                         ← installer (registers the Camel MCP server)
 ├── global/
-│   ├── CLAUDE.md                      ← global behavioral instructions (1)
-│   ├── settings.json                  ← tool permissions + Stop hook    (2)
-│   └── settings.local.json            ← local sudo / apt overrides      (3)
-├── skills/
-│   ├── memory-analysis/SKILL.md       ← Volatility 3 skill              (4)
-│   ├── plaso-timeline/SKILL.md        ← Plaso / log2timeline skill      (5)
-│   ├── sleuthkit/SKILL.md             ← Sleuth Kit / TSK skill          (6)
-│   ├── windows-artifacts/SKILL.md     ← EZ Tools / EVTX / Registry      (7)
-│   └── yara-hunting/SKILL.md          ← YARA / threat hunting skill     (8)
+│   ├── CLAUDE.md                      ← global instructions: drive DFIR through Camel
+│   └── settings.json                  ← allow mcp__camel__*; deny raw forensic CLIs
 ├── case-templates/
-│   └── CLAUDE.md                      ← per-case project template       (9)
+│   ├── CLAUDE.md                      ← per-case template (Camel SDK recipes)
+│   └── .mcp.json                      ← registers the `camel` stdio MCP server
 └── analysis-scripts/
-    └── generate_pdf_report.py         ← WeasyPrint PDF generator        (10)
+    └── generate_pdf_report.py         ← WeasyPrint PDF generator (unchanged)
 ```
 
 ---
 
-## File-by-File Installation Instructions
-
-### (1) global/CLAUDE.md → `~/.claude/CLAUDE.md`
-
-**What it is:** The global system prompt that loads for every Claude Code session,
-regardless of working directory. Sets the operator role (Principal DFIR Orchestrator),
-evidence integrity rules, tool routing table, installed tool paths, and the no-questions
-autonomous operation preference.
-
-**Install:**
-```bash
-cp global/CLAUDE.md ~/.claude/CLAUDE.md
-```
-
-**Customise:**
-- Update the `Installed Tool Paths` table if your SIFT instance has tools in different locations.
-- If you use MemProcFS or VSCMount (Windows VMs only), add them to the table.
-- The `## Operator Preferences` section sets fully autonomous mode — adjust if you prefer confirmations.
-
----
-
-### (2) global/settings.json → `~/.claude/settings.json`
-
-**What it is:** The main Claude Code permission policy. Pre-approves all DFIR CLI tools
-(Volatility, Sleuth Kit, EZ Tools, Plaso, bulk_extractor, YARA, hash tools, etc.) so
-Claude never pauses to ask permission mid-investigation. Also contains a `Stop` hook
-that writes a forensic audit log entry to `./analysis/forensic_audit.log` at the end
-of every conversation.
-
-**Install:**
-```bash
-cp global/settings.json ~/.claude/settings.json
-```
-
-**Key sections:**
-- `permissions.allow` — all forensic CLIs are pre-approved
-- `permissions.deny` — blocks `rm -rf`, `dd`, `wget`, `curl`, `ssh`, and `WebFetch`
-  (prevents Claude from exfiltrating data or wiping evidence)
-- `permissions.defaultMode` — `"acceptEdits"` means file edits in allowed paths
-  auto-approve without a prompt
-- `hooks.Stop` — appends conversation summary to `./analysis/forensic_audit.log`
-  for chain-of-custody documentation
-
-**Important — Write path restrictions:**
-The `Write` and `Edit` allow-list is scoped to `./analysis/*`, `./reports/*`, and
-`./exports/*` (relative to whichever case directory you `cd` into before launching
-`claude`). This is intentional — it prevents writing to evidence directories. Do **not**
-broaden this to `/cases/**` or `/mnt/**`.
-
----
-
-### (3) global/settings.local.json → `~/.claude/settings.local.json`
-
-**What it is:** Machine-local overrides. Currently allows `sudo apt` installs and the
-`psort.py` Plaso command. This file is intentionally minimal — it holds only things
-that differ per-machine, not per-case.
-
-**Install:**
-```bash
-cp global/settings.local.json ~/.claude/settings.local.json
-```
-
----
-
-### (4–8) skills/ → `~/.claude/skills/`
-
-**What they are:** Skill files are domain-specific prompt libraries that Claude loads
-on demand. Each `SKILL.md` contains exact CLI invocations, common flags, known
-gotchas, and output interpretation guidance for a specific forensic toolset.
-
-| Skill file | Domain | Key tools covered |
-|------------|--------|-------------------|
-| `memory-analysis/SKILL.md` | Memory forensics | Volatility 3 plugins, symbol resolution, memory baseliner |
-| `plaso-timeline/SKILL.md` | Timeline generation | log2timeline.py, psort.py, pinfo.py, super-timeline filters |
-| `sleuthkit/SKILL.md` | Filesystem forensics | fls, icat, mmls, mactime, tsk_recover, ewfmount offsets |
-| `windows-artifacts/SKILL.md` | Windows artifacts | EZ Tools suite, EvtxECmd, MFTECmd, RECmd, AmcacheParser |
-| `yara-hunting/SKILL.md` | Threat hunting | YARA rules, IOC sweeps, bulk scanning |
-
-**Install:**
-```bash
-mkdir -p ~/.claude/skills/memory-analysis \
-         ~/.claude/skills/plaso-timeline \
-         ~/.claude/skills/sleuthkit \
-         ~/.claude/skills/windows-artifacts \
-         ~/.claude/skills/yara-hunting
-
-cp skills/memory-analysis/SKILL.md  ~/.claude/skills/memory-analysis/SKILL.md
-cp skills/plaso-timeline/SKILL.md   ~/.claude/skills/plaso-timeline/SKILL.md
-cp skills/sleuthkit/SKILL.md        ~/.claude/skills/sleuthkit/SKILL.md
-cp skills/windows-artifacts/SKILL.md ~/.claude/skills/windows-artifacts/SKILL.md
-cp skills/yara-hunting/SKILL.md     ~/.claude/skills/yara-hunting/SKILL.md
-```
-
-**How Claude uses them:** The global `CLAUDE.md` contains a routing table that
-tells Claude which skill file to consult before using each tool category. Claude
-reads the skill file at task time — you do not need to invoke them manually.
-
----
-
-### (9) case-templates/CLAUDE.md → `/cases/<casename>/CLAUDE.md`
-
-**What it is:** A per-case project CLAUDE.md. When you `cd /cases/<casename>` and
-launch `claude`, this file is loaded automatically as project-level instructions,
-layered on top of the global `~/.claude/CLAUDE.md`.
-
-**Install for a new case:**
-
-If you used the installer (`install.sh` or the curl one-liner), the template is already
-at `~/.claude/case-templates/CLAUDE.md`:
-```bash
-mkdir -p /cases/<CASENAME>
-cp ~/.claude/case-templates/CLAUDE.md /cases/<CASENAME>/CLAUDE.md
-```
-
-If you have the repo or archive available, copy from there instead:
-```bash
-mkdir -p /cases/<CASENAME>
-cp case-templates/CLAUDE.md /cases/<CASENAME>/CLAUDE.md
-```
-
-**Required customisations for each new case:**
-1. Update `## Case Overview` — client name, domain, threat actor, incident date, role
-2. Update `## Evidence Files` — list all E01/img files with their system/role
-3. Update `## Common Commands` — adjust image paths and filenames
-4. Update `## Network Topology` — subnet map for the specific engagement
-5. Update `## Domain Accounts` — DA and service accounts discovered
-6. Update `## Known IOCs` — populate as artifacts are confirmed
-7. Update `## Incident Timeline` — build out as analysis progresses
-
-The template as shipped reflects the SRL FOR508 lab scenario. Strip the SRL-specific
-content and fill in new case details before use.
-
----
-
-### (10) analysis-scripts/generate_pdf_report.py → `/cases/<casename>/analysis/generate_pdf_report.py`
-
-**What it is:** A reusable WeasyPrint-based PDF report generator. Claude uses this
-as its output engine for all forensic PDF reports. It accepts a `data` dict and an
-`output_path` string and renders an HTML template to PDF.
-
-**Install:**
-
-If you used the installer, copy from `~/.claude/analysis-scripts/`:
-```bash
-mkdir -p /cases/<CASENAME>/analysis
-cp ~/.claude/analysis-scripts/generate_pdf_report.py /cases/<CASENAME>/analysis/generate_pdf_report.py
-```
-
-If you have the repo or archive available:
-```bash
-mkdir -p /cases/<CASENAME>/analysis
-cp analysis-scripts/generate_pdf_report.py /cases/<CASENAME>/analysis/generate_pdf_report.py
-```
-
-**Dependency:**
-```bash
-pip3 install weasyprint
-# If weasyprint fails, also install:
-sudo apt-get install -y python3-gi python3-gi-cairo gir1.2-gtk-3.0 libpango-1.0-0
-```
-
-**Usage pattern:** Claude generates a `generate_<topic>_report.py` script per
-investigation that imports this module:
-```python
-import sys
-sys.path.insert(0, './analysis')
-from generate_pdf_report import generate_report
-
-DATA = {
-    "case_id":     "CASE-ID-001",
-    "client":      "Client Name",
-    "prepared_by": "DFIR Consultant",
-    "title":       "Report Title",
-    "subtitle":    "Evidence source · System · Key Finding",
-    "body_html":   BODY,   # MUST be r"""...""" raw string if body contains Windows paths
-}
-generate_report(DATA, "./analysis/report-name.pdf")
-```
-
-**Critical gotcha:** The `body_html` variable must use a Python **raw string**
-(`r"""..."""`) if it contains Windows filesystem paths (e.g. `C:\Users\...`).
-Otherwise Python will raise a `SyntaxError: unicode error 'unicodeescape'` on `\U`
-and `\S` escape sequences.
-
----
-
-## Manual Install Script (copy-paste)
-
-If you prefer not to run `install.sh` directly, copy-paste the following from the
-root of your cloned repo or extracted archive. This is exactly what `install.sh`
-does, without the backup logic or prompts.
+## Starting a fresh investigation
 
 ```bash
-#!/bin/bash
-set -e
-
-# 1. Global config
-mkdir -p ~/.claude
-cp global/CLAUDE.md ~/.claude/CLAUDE.md
-cp global/settings.json ~/.claude/settings.json
-cp global/settings.local.json ~/.claude/settings.local.json
-
-# 2. Skills
-mkdir -p ~/.claude/skills/memory-analysis \
-         ~/.claude/skills/plaso-timeline \
-         ~/.claude/skills/sleuthkit \
-         ~/.claude/skills/windows-artifacts \
-         ~/.claude/skills/yara-hunting
-
-cp skills/memory-analysis/SKILL.md   ~/.claude/skills/memory-analysis/SKILL.md
-cp skills/plaso-timeline/SKILL.md    ~/.claude/skills/plaso-timeline/SKILL.md
-cp skills/sleuthkit/SKILL.md         ~/.claude/skills/sleuthkit/SKILL.md
-cp skills/windows-artifacts/SKILL.md ~/.claude/skills/windows-artifacts/SKILL.md
-cp skills/yara-hunting/SKILL.md      ~/.claude/skills/yara-hunting/SKILL.md
-
-# 3. Case template and analysis scripts (reusable across cases)
-mkdir -p ~/.claude/case-templates ~/.claude/analysis-scripts
-cp case-templates/CLAUDE.md ~/.claude/case-templates/CLAUDE.md
-cp analysis-scripts/generate_pdf_report.py ~/.claude/analysis-scripts/generate_pdf_report.py
-
-# 4. Python dependency for PDF reports
-pip3 install weasyprint
-
-echo "Done. Start a new case with:"
-echo "  export CASE=CLIENT-IR-2025-001"
-echo "  mkdir -p /cases/\${CASE}/{analysis,exports,reports}"
-echo "  cp ~/.claude/case-templates/CLAUDE.md /cases/\${CASE}/CLAUDE.md"
-echo "  cp ~/.claude/analysis-scripts/generate_pdf_report.py /cases/\${CASE}/analysis/"
-echo "  nano /cases/\${CASE}/CLAUDE.md"
-echo "  cd /cases/\${CASE} && claude"
-```
-
----
-
-## What Is NOT Included (and Why)
-
-| Excluded | Reason |
-|----------|--------|
-| `~/.claude/.credentials.json` | Contains your Anthropic API key — never share or copy this |
-| `~/.claude/history.jsonl` | Session command history — machine/session specific |
-| `~/.claude/projects/` | Session memory and conversation state — case specific |
-| `~/.claude/debug/` | Session debug logs — not portable |
-| `~/.claude/telemetry/` | Usage telemetry — machine specific |
-| `~/.claude/cache/` | Auto-regenerated on first run |
-| `~/.claude/backups/` | Auto-generated config backups |
-| `~/.claude/plugins/` | Auto-downloaded from Anthropic marketplace on first run |
-| `/cases/srl/analysis/*.py` (generated) | Case-specific report scripts — not reusable as-is |
-| Evidence files (*.E01, *.img) | Read-only evidence — never copy or share |
-
----
-
-## Starting a Fresh Investigation
-
-After running the installer, the case template and analysis script live in `~/.claude/`
-and are ready to copy into any new case directory — no need to keep the repo around.
-
-```bash
-# 1. Prepare case directory
+# 1. Prepare the case directory
 export CASE=CLIENT-IR-2025-001
 mkdir -p /cases/${CASE}/{analysis,exports,reports}
 cp ~/.claude/case-templates/CLAUDE.md /cases/${CASE}/CLAUDE.md
+cp ~/.claude/case-templates/.mcp.json /cases/${CASE}/.mcp.json   # registers the camel server
 cp ~/.claude/analysis-scripts/generate_pdf_report.py /cases/${CASE}/analysis/
 nano /cases/${CASE}/CLAUDE.md   # fill in case details
 
-# 2. Mount evidence (example — adjust paths)
-sudo mkdir -p /mnt/ewf_rd01 /mnt/rd01
-sudo ewfmount /cases/${CASE}/suspect.E01 /mnt/ewf_rd01
-OFFSET=$(sudo mmls /mnt/ewf_rd01/ewf1 | awk '/NTFS/{print $3; exit}')
-sudo mount -o ro,loop,noatime,offset=$((OFFSET*512)) /mnt/ewf_rd01/ewf1 /mnt/rd01
+# 2. Make evidence available to Camel (Camel mounts/reads it read-only via its SDK)
 
-# 3. Launch Claude from case root (critical — sets relative Write paths)
+# 3. Launch Claude from the case root (sets relative Write paths)
 cd /cases/${CASE}
 claude
 ```
 
+In the session, Claude reads `camel://sdk/core` and `camel://sdk/schema`, calls `SetCaseId`, then
+drives the case with `ExecuteJavaScript` — preferring Camel workflows, dropping to toolkits for
+primitives, and using the anomaly engine to triage large timelines.
+
 ---
 
-## Notes on Chain of Custody
+## Chain of custody
 
-- Claude never writes to `/cases/`, `/mnt/`, or `/media/` — enforced by `settings.json`
-- The `Stop` hook appends an audit log entry to `./analysis/forensic_audit.log`
-  after every session — review this log as part of your case documentation
-- All tool outputs use `tee` to write to `./exports/` — raw tool output is preserved
-- Always verify image integrity before analysis: `ewfverify /cases/${CASE}/*.E01`
+- **Read-only evidence** — Camel mounts and reads evidence read-only; Claude never writes to
+  `/cases/`, `/mnt/`, or `/media/`.
+- **Per-case audit log** — Camel records every tool execution to `audit-<caseId>.clef` (case id,
+  toolkit/tool, command, host, exit code, duration). Each `ExecuteJavaScript` result ends with an
+  `[audit] case=<caseId> invocation=<id>` handle; Claude cites it next to each finding so a reviewer
+  can trace any conclusion back to the exact commands that produced it.
+- **No raw shell** — the forensic CLIs are denied by policy; all tool execution flows through Camel.
+
+---
+
+## What is NOT included (and why)
+
+| Excluded | Reason |
+|----------|--------|
+| `~/.claude/.credentials.json` | Your Anthropic API key — never share or copy |
+| `~/.claude/history.jsonl`, `projects/`, `debug/`, `telemetry/`, `cache/` | Session/machine specific |
+| Camel itself | Built and published separately; this fork only wires Claude Code to it |
+| Evidence files (*.E01, *.img) | Read-only evidence — never copy or share |
+
+---
+
+## Credits
+
+Protocol SIFT was created by Rob Lee. This fork adapts it to the Camel code-mode DFIR runtime for the
+SANS Find Evil! AI Hackathon.

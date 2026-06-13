@@ -1,6 +1,9 @@
 {
   "permissions": {
     "allow": [
+      "mcp__camel__SetCaseId",
+      "mcp__camel__ExecuteJavaScript",
+
       "Bash(*)",
       "Read",
       "Write(./analysis/*)",
@@ -74,7 +77,7 @@
       "Bash(scalpel *)",
       "Bash(strings *)",
       "Bash(floss *)",
-      
+
       "Bash(tshark *)",
       "Bash(tcpdump *)",
       "Bash(ngrep *)",
@@ -130,16 +133,5 @@
       "WebFetch"
     ]
   },
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "mkdir -p ./analysis/ && echo \"$(date -u): $CONVERSATION_SUMMARY\" >> ./analysis/forensic_audit.log"
-          }
-        ]
-      }
-    ]
-  }
+  "enableAllProjectMcpServers": true
 }
