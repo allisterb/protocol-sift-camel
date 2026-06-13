@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO_URL="https://github.com/allisterb/protocol-sift-camel.git"
 CLAUDE_DIR="${HOME}/.claude"
-TMPDIR_PREFIX="protocol-sift-camel-install"
+TMPDIR_PREFIX="protocol-sift-install"
 
 # Path to the published Camel CLI assembly that hosts the MCP server.
 # Override with the CAMEL_DLL env var or the first positional argument.
@@ -65,6 +65,35 @@ else
     command -v claude >/dev/null 2>&1 || \
         warn "Claude Code installed but 'claude' not yet in PATH. Open a new shell after this script finishes."
     ok "Claude Code installed."
+fi
+echo
+
+# ── .NET runtime (Camel targets .NET 9) ───────────────────────────────────────
+
+if command -v dotnet >/dev/null 2>&1; then
+    DOTNET_MAJOR="$(dotnet --list-runtimes 2>/dev/null \
+        | sed -n 's/^Microsoft\.NETCore\.App \([0-9]*\)\..*/\1/p' | sort -rn | head -1)"
+    if [[ -n "${DOTNET_MAJOR:-}" && "${DOTNET_MAJOR}" -ge 9 ]]; then
+        ok ".NET runtime ${DOTNET_MAJOR}.x found."
+    else
+        warn "Camel needs the .NET 9 runtime, but the highest installed is '${DOTNET_MAJOR:-none}'."
+        warn "Install it before launching the server:  https://dotnet.microsoft.com/download/dotnet/9.0"
+    fi
+else
+    warn "dotnet not found. Camel needs the .NET 9 runtime to host the MCP server."
+    warn "Install it before launching:  https://dotnet.microsoft.com/download/dotnet/9.0"
+fi
+
+# ── locate the Camel CLI assembly ─────────────────────────────────────────────
+
+if [[ -f "$CAMEL_DLL" ]]; then
+    CAMEL_DLL="$(cd "$(dirname "$CAMEL_DLL")" && pwd)/$(basename "$CAMEL_DLL")"   # absolute
+    ok "Camel CLI assembly: $CAMEL_DLL"
+else
+    warn "Camel CLI assembly not found at: $CAMEL_DLL"
+    warn "Publish Camel and re-run with the correct path, e.g.:"
+    warn "    CAMEL_DLL=/opt/camel/Camel.CLI.dll bash install.sh"
+    warn "Continuing — the generated .mcp.json will still point at this path."
 fi
 echo
 

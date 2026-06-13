@@ -175,9 +175,9 @@ if (hits.IsSuccess) for (const h of hits.Result.Events) log(`${h.Time}  ${h.Desc
 
 ## Notes
 
-- All forensic tool execution and the chain-of-custody audit log are handled by Camel
-  (`audit-<caseId>.clef`). Do not run forensic CLIs directly — `Bash` is denied by policy, so Camel
-  is the only execution path.
+- **Kansa Autorunsc CSVs** (`rd01/dc01/file01/hunt01`) are on the Windows forensic workstation at `G:\SRL_Evidence\kansa\kansa-post-intrusion\Output_20230129122316\Autorunsc\` — not on this SIFT instance.
+- **MemProcFS** is not installed on this SIFT instance.
+- **VSCMount** is Windows-only — do not use on SIFT.
 - Timestamps: always report in UTC.
 - Reports: write your report as Markdown to `./reports/` with the Write tool. (PDF rendering via
   `generate_pdf_report.py` needs the shell, which is denied — it's an optional manual post-step for

@@ -62,9 +62,7 @@ session (`dotnet <CAMEL_DLL> server`) — there is nothing extra to start. The s
 | `camel://sdk/core` (resource) | SDK execution model + every object/method |
 | `camel://sdk/schema` (resource) | JSON schema of every returned value |
 
-Permissions in `global/settings.json` pre-approve `mcp__camel__*` and the file tools (`Read` +
-scoped `Write`/`Edit` to the output dirs), and **deny `Bash`** — so the agent can only act through
-Camel. `CLAUDE.md` reinforces this in instructions.
+### Method 1 — curl one-liner (recommended)
 
 > **Transport note:** stdio is used by design — Camel's session management, the `SetCaseId` audit
 > attribution, the progress heartbeat, and cancellation are all transport-agnostic (stdio buckets the
